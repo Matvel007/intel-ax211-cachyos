@@ -1,51 +1,53 @@
-# Intel AX211 (CNVi) на CachyOS: падение при загрузке, emergency mode, зависание выключения
+# Intel AX211 (CNVi) on CachyOS: boot-time firmware crash, emergency mode, shutdown hang
 
-Разбор реальной проблемы и рабочее исправление. Всё проверено на живой машине,
-данные — из `journalctl`, `dmesg` и дампов прошивки.
+[🇷🇺 Русская версия](README.ru.md)
 
-**TL;DR** — одна строка в `/etc/modprobe.d/iwlwifi.conf`:
+A real-world problem breakdown and a working fix. Everything was verified on live
+hardware — data comes from `journalctl`, `dmesg` and firmware crash dumps.
+
+**TL;DR** — one line in `/etc/modprobe.d/iwlwifi.conf`:
 
 ```
 options iwlwifi disable_11ax=1
 ```
 
-Откат с 802.11ax (Wi-Fi 6) на 802.11ac убирает падения прошивки. 8 загрузок
-подряд без единого сбоя, до этого — 5 провалов из 7.
+Dropping from 802.11ax (Wi-Fi 6) to 802.11ac eliminates the firmware crashes.
+8 consecutive clean boots, down from 5 failures out of 7.
 
 ---
 
-## Железо и система
+## Hardware and system
 
 | | |
 |---|---|
-| Ноутбук | MECHREVO KUANGSHI Series, Intel Core i5-14450HX |
-| Wi-Fi | Intel Wi-Fi 6E AX211, CNVi, PCI `8086:7a70`, PCI-адрес `0000:00:14.3` |
-| Проводная | Realtek RTL8125 2.5GbE, PCI `10ec:8125`, `0000:05:00.0` |
+| Laptop | MECHREVO KUANGSHI Series, Intel Core i5-14450HX |
+| Wi-Fi | Intel Wi-Fi 6E AX211, CNVi, PCI `8086:7a70`, address `0000:00:14.3` |
+| Ethernet | Realtek RTL8125 2.5GbE, PCI `10ec:8125`, `0000:05:00.0` |
 | GPU | NVIDIA RTX 5060 Laptop + Intel iGPU |
-| BIOS | AMI `N.1.21MRO16` от 24.07.2025 |
-| Дистрибутив | CachyOS (Arch-based) |
-| Ядра | `7.3.4-1-cachyos` (основное), `6.18.60-2-cachyos-lts` |
-| Прошивка Wi-Fi | `89.735b75a4.0`, `iwlwifi-so-a0-gf-a0-89.ucode` |
-| Загрузчик | Limine, btrfs + snapper |
+| BIOS | AMI `N.1.21MRO16`, 2025-07-24 |
+| Distro | CachyOS (Arch-based) |
+| Kernels | `7.3.4-1-cachyos` (main), `6.18.60-2-cachyos-lts` |
+| Wi-Fi firmware | `89.735b75a4.0`, `iwlwifi-so-a0-gf-a0-89.ucode` |
+| Bootloader | Limine, btrfs + snapper |
 
 ---
 
-## Симптомы
+## Symptoms
 
-Три разных проявления, одна причина.
+Three different manifestations, one root cause.
 
-### 1. Ноутбук не загружается
+### 1. The laptop does not boot
 
 ```
 Failed to load your GPU driver(s)
 You can't get into desktop environment right now
 ```
 
-Падение в emergency mode. Не помогало ничего: ни обычное ядро, ни LTS, ни
-загрузка со снапшота. `systemctl --failed` показывал `avahi-daemon.service` и
-`polkit.service`, что уводит в сторону — они просто жертвы.
+Drops into emergency mode. Nothing helped: neither the main kernel, nor LTS, nor
+booting from a snapshot. `systemctl --failed` reported `avahi-daemon.service` and
+`polkit.service`, which sends you down the wrong path — they are just casualties.
 
-### 2. Выключение зависает
+### 2. Shutdown hangs
 
 ```
 [FAILED] Failed unmounting /var/cache
@@ -53,24 +55,24 @@ You can't get into desktop environment right now
 pcieport 0000:00:1d.0: AER: Error of this Agent is reported first
 ```
 
-Помогает только кнопка питания.
+Only the power button gets you out.
 
-### 3. Wi-Fi отваливается в работе
+### 3. Wi-Fi drops while working
 
 ```
 iwlwifi 0000:00:14.3: Device error - SW reset
 iwlwifi 0000:00:14.3: restart completed
 ```
 
-Интернет пропадает на 30 секунд — 3.5 минуты, потом возвращается сам.
+Connectivity disappears for 30 seconds to 3.5 minutes, then comes back by itself.
 
 ---
 
-## Диагностика
+## Diagnosis
 
-### Настоящая причина зависания загрузки
+### The real cause of the boot hang
 
-Ключ — стек заблокированного процесса:
+The key is the stack of the blocked process:
 
 ```bash
 journalctl --directory=/mnt/root/var/log/journal -b -1 | grep -A25 'task:modprobe'
@@ -90,19 +92,19 @@ task:modprobe  state:D
   do_init_module
 ```
 
-Что происходит:
+What happens:
 
-1. Прошивка Wi-Fi падает на инициализации
-2. Драйвер пытается остановить устройство и **навсегда застревает** в
-   `synchronize_irq`, ожидая прерывание, которое уже не придёт
-3. Процесс `modprobe` держит `module_mutex` — глобальную блокировку загрузки модулей
-4. **После этого не грузится ни один модуль.** В том числе `nvidia_drm`
-5. Отсюда «Failed to load your GPU driver(s)» и emergency mode
+1. The Wi-Fi firmware crashes during initialization
+2. The driver tries to stop the device and **gets stuck forever** in
+   `synchronize_irq`, waiting for an interrupt that will never arrive
+3. The `modprobe` process holds `module_mutex` — the global module loading lock
+4. **After that no module loads at all.** Including `nvidia_drm`
+5. Hence "Failed to load your GPU driver(s)" and emergency mode
 
-То есть GPU-ошибка — это следствие, а не причина. Отсюда и бесполезность
-снапшотов: дело не в корневой файловой системе.
+So the GPU error is a consequence, not the cause. That is also why snapshots did
+nothing — the root filesystem was never the problem.
 
-### Дамп прошивки при падении
+### Firmware dump on crash
 
 ```
 iwlwifi 0000:00:14.3: 0x00000084 | NMI_INTERRUPT_UNKNOWN
@@ -112,42 +114,42 @@ iwlwifi 0000:00:14.3: SecBoot CPU1 Status: 0x8650, CPU2 Status: 0xb03
 iwlwifi 0000:00:14.3: Failed to start RT ucode: -110
 ```
 
-`FSEQ_ERROR_CODE` ненулевой — это платформенная инициализация CNVi на стороне
-чипсета (CSME) проваливается **до** того, как драйвер вступает в дело.
-`SecBoot CPU1 Status` появляется только в неудачных загрузках, в успешных его нет.
+`FSEQ_ERROR_CODE` is non-zero — this is the platform-side CNVi initialization on
+the chipset (CSME) failing **before** the driver gets involved. `SecBoot CPU1
+Status` appears only in failed boots; successful ones never show it.
 
-В работе падение выглядит иначе — предвестник:
+A crash during normal operation looks different — the precursor is:
 
 ```
 iwlwifi 0000:00:14.3: Error sending SYSTEM_STATISTICS_CMD: time out after 2000ms.
 iwlwifi 0000:00:14.3: Current CMD queue read_ptr 831 write_ptr 832
 ```
 
-Прошивка перестаёт отвечать на команды, потом падает.
+The firmware stops answering commands, then crashes.
 
-### Регрессия ядра, превращающая сбой в мёртвое зависание
+### The kernel regression that turns a crash into a hard hang
 
-Коммит [`0eaa1f245ac0`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=0eaa1f245ac0)
-(«wifi: iwlwifi: mvm: don't support the reset handshake for old firmwares»),
-вошёл в **v7.1-rc7**.
+Commit [`0eaa1f245ac0`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=0eaa1f245ac0)
+("wifi: iwlwifi: mvm: don't support the reset handshake for old firmwares"),
+landed in **v7.1-rc7**.
 
-Код в `drivers/net/wireless/intel/iwlwifi/mvm/ops.c`:
+The code in `drivers/net/wireless/intel/iwlwifi/mvm/ops.c`:
 
 ```c
 if (IWL_UCODE_MAJOR(mvm->fw->ucode_ver) <= 77)
     trans->conf.fw_reset_handshake = false;
 ```
 
-Прошивка версии 89 хранит версию в новом TLV-формате как `0x59` (89).
-`IWL_UCODE_MAJOR()` сдвигает на 24 бита и получает **0**. Условие `0 <= 77`
-истинно → reset-handshake отключается → драйвер теряет механизм мягкого сброса
-и виснет вместо перезапуска карты.
+Firmware version 89 stores its version in the new TLV format as `0x59` (89).
+`IWL_UCODE_MAJOR()` shifts by 24 bits and gets **0**. The `0 <= 77` condition is
+true → reset-handshake is disabled → the driver loses its soft-reset mechanism and
+hangs instead of restarting the card.
 
-Регрессия зарегистрирована в [regzbot](https://linux-regtracking.leemhuis.info/regzbot/regression/lore/amzVtgQb2p-_nShU@debian.local/)
-как «iwlwifi IO_PAGE_FAULT and Master Disable Timed Out».
+The regression is tracked in [regzbot](https://linux-regtracking.leemhuis.info/regzbot/regression/lore/amzVtgQb2p-_nShU@debian.local/)
+as "iwlwifi IO_PAGE_FAULT and Master Disable Timed Out".
 
-**Где исправлено:** в `linux-next`, но не в mainline на момент проверки
-(17.11.2026):
+**Where it is fixed:** in `linux-next`, but not in mainline as of the time of
+testing (2026-11-17):
 
 ```c
 trans->conf.fw_reset_handshake =
@@ -156,34 +158,35 @@ trans->conf.fw_reset_handshake =
     mvm->fw->ucode_ver > 77;
 ```
 
-**Практический вывод:** `7.3.4-1-cachyos` содержит регрессию, `6.18.60-2-cachyos-lts`
-— нет. Это единственное реальное различие между ядрами в контексте проблемы.
+**Practical takeaway:** `7.3.4-1-cachyos` contains the regression,
+`6.18.60-2-cachyos-lts` does not. That is the only real difference between the
+kernels in the context of this problem.
 
-### Что НЕ является причиной
+### What is NOT the cause
 
-Проверялось и отброшено:
+Tested and ruled out:
 
-- **Прошивка.** Пробовал три билда: `735b75a4` (пакет 20260622),
-  `a67023b2` (core24.90-60, upstream от 08.11.2026), `123cf747` (core102-56).
-  Первый — 5 провалов из 7, второй — **11 из 12, стало хуже**, третий не
-  проверялся. Смена прошивки меняет вероятность, но не убирает причину.
-- **ASPM.** Уже выключен на обоих концах линка (`LnkCtl: ASPM Disabled`).
-- **Быстрая перезагрузка.** Корреляция с паузой была (20–27 с → сбой,
-  43 с → успех), но после фикса `disable_11ax` перезагрузки подряд без пауз
-  проходят чисто.
-- **`power_save` / `power_scheme`.** Помогают от другого — от высокого пинга,
-  но падения на инициализации не убирают.
-- **Хук `modprobe -r iwlwifi` в `system-shutdown`.** Не помогает и опасен: при
-  крахнутой карте выгрузка виснет в том же `synchronize_irq`, и выключение
-  зависает навсегда.
-- **AER-ошибки от Realtek RTL8125.** Отдельный дефект (см. ниже), к Wi-Fi
-  отношения не имеет.
+- **Firmware.** Tried three builds: `735b75a4` (package 20260622), `a67023b2`
+  (core24.90-60, upstream 2026-11-08), `123cf747` (core102-56). First: 5 failures
+  out of 7. Second: **11 out of 12, made it worse**. Third: not tested. Changing
+  firmware changes the probability, not the cause.
+- **ASPM.** Already disabled on both link ends (`LnkCtl: ASPM Disabled`).
+- **Warm vs cold reboot.** There was a correlation with the pause between boots
+  (20–27 s → failure, 43 s → success), but after the `disable_11ax` fix, back-to-back
+  reboots pass cleanly.
+- **`power_save` / `power_scheme`.** These fix something else — high latency — but
+  do not eliminate the initialization crashes.
+- **A `modprobe -r iwlwifi` hook in `system-shutdown`.** Does not help and is
+  dangerous: with a crashed card, unloading hangs in the very same
+  `synchronize_irq`, and shutdown hangs forever.
+- **AER errors from the Realtek RTL8125.** A separate defect (see below), unrelated
+  to Wi-Fi.
 
 ---
 
-## Исправление
+## The fix
 
-### 1. Отключить Wi-Fi 6 (802.11ax) — главное
+### 1. Disable Wi-Fi 6 (802.11ax) — the main one
 
 `/etc/modprobe.d/iwlwifi.conf`:
 
@@ -193,24 +196,24 @@ options iwlwifi power_save=0
 options iwlmvm power_scheme=1
 ```
 
-Основание: разбор AX211 в [Ubuntu Discourse](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
-— «the firmware bug lives in the 802.11ax Target Wake Time path», откат на
-802.11ac его обходит.
+Basis: the AX211 analysis in [Ubuntu Discourse](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
+— "the firmware bug lives in the 802.11ax Target Wake Time path"; falling back to
+802.11ac avoids it.
 
-Почему работает: падение происходит в TWT-логике 802.11ax. Без ax карта
-инициализируется по другому пути, и `FSEQ_ERROR_CODE` не возникает.
+Why it works: the crash happens in the 802.11ax TWT logic. Without ax the card
+initializes through a different path, and `FSEQ_ERROR_CODE` never shows up.
 
-**Цена:** линк 802.11ac вместо 802.11ax. Скорость 1404–1733 Мбит/с вместо 1921
-при ширине 160 МГц. Для домашней сети незаметно.
+**Cost:** an 802.11ac link instead of 802.11ax. 1404–1733 Mbit/s instead of 1921
+at 160 MHz width. Negligible for a home network.
 
-**Проверка:**
+**Verification:**
 
 ```bash
 cat /sys/module/iwlwifi/parameters/disable_11ax    # → Y
-iw dev wlan0 link | grep bitrate                   # → VHT-MCS, не HE-MCS
+iw dev wlan0 link | grep bitrate                   # → VHT-MCS, not HE-MCS
 ```
 
-### 2. Убрать AER-шторм от RTL8125
+### 2. Stop the AER storm from the RTL8125
 
 `/etc/modprobe.d/blacklist-r8169.conf`:
 
@@ -218,7 +221,8 @@ iw dev wlan0 link | grep bitrate                   # → VHT-MCS, не HE-MCS
 blacklist r8169
 ```
 
-Проблема: проводной порт без кабеля сыпет корректируемыми PCIe-ошибками.
+Problem: the wired port, with no cable plugged in, floods the log with correctable
+PCIe errors.
 
 ```
 r8169 0000:05:00.0: PCIe Bus Error: severity=Correctable, type=Data Link Layer, (Transmitter ID)
@@ -226,17 +230,17 @@ r8169 0000:05:00.0:    [12] Timeout
 aer_ratelimit: 9884 callbacks suppressed
 ```
 
-Почти десять тысяч подавленных сообщений за одну вспышку, до 4+ ошибок в секунду,
-каждая — прерывание. Причина в драйвере, не в железе: без `r8169` за 5+ минут
-**ноль** новых ошибок.
+Almost ten thousand suppressed messages in a single burst, 4+ errors per second,
+each one an interrupt. The cause is in the driver, not the hardware: without
+`r8169` there were **zero** new errors over 5+ minutes.
 
-`blacklist` блокирует только автозагрузку. Понадобится проводной интернет:
+`blacklist` only blocks autoloading. If you need wired networking:
 
 ```bash
 sudo modprobe r8169
 ```
 
-### 3. Выключить энергосбережение Wi-Fi
+### 3. Disable Wi-Fi power saving
 
 `/etc/NetworkManager/conf.d/99-wifi-powersave-off.conf`:
 
@@ -245,48 +249,50 @@ sudo modprobe r8169
 wifi.powersave = 2
 ```
 
-Без этого пинг по локальной сети 40–165 мс вместо 1–3.
+Without this, LAN ping is 40–165 ms instead of 1–3 ms.
 
 ---
 
-## Результаты
+## Results
 
-Замеры на `7.3.4-1-cachyos`, прошивка `735b75a4`.
+Measured on `7.3.4-1-cachyos`, firmware `735b75a4`.
 
-### До исправления
-
-| | |
-|---|---|
-| Загрузок | 7 |
-| С провалом | **5** |
-| Зависаний `synchronize_irq` | 4 в одной загрузке |
-| `Device error - SW reset` в работе | 4 за день |
-
-### После
+### Before the fix
 
 | | |
 |---|---|
-| Загрузок на 7.3.4 | **8** |
-| С провалом | **0** |
-| Зависаний | 0 |
+| Boots | 7 |
+| Failed | **5** |
+| `synchronize_irq` hangs | 4 in a single boot |
+| `Device error - SW reset` during use | 4 per day |
+
+### After
+
+| | |
+|---|---|
+| Boots on 7.3.4 | **8** |
+| Failed | **0** |
+| Hangs | 0 |
 | `Failed to start RT ucode` | 0 |
 | `Device error - SW reset` | 0 |
-| `SecBoot CPU1 Status` | не появлялся ни разу |
+| `SecBoot CPU1 Status` | never appeared |
 
-Пинг по LAN: 1.0–2.5 мс, 0% потерь.
-Сигнал: −47 dBm, 160 МГц, `VHT-MCS 9`.
+LAN ping: 1.0–2.5 ms, 0% loss.
+Signal: −47 dBm, 160 MHz, `VHT-MCS 9`.
 
-Для сравнения, LTS `6.18.60` с тем же конфигом: **5 загрузок, 3 с провалом** (20:14, 20:44,
-20:47). То есть с фиксом обычное ядро лучше LTS — регрессия `0eaa1f245ac0` там
-не срабатывает, потому что прошивка больше не падает, а само ядро новее.
+For comparison, LTS `6.18.60` with the same config: **5 boots, 3 failed**
+(20:14, 20:44, 20:47). So with the fix the main kernel beats LTS — the
+`0eaa1f245ac0` regression never triggers because the firmware no longer crashes,
+and the kernel itself is newer.
 
-Оговорка: логи LTS-загрузок, сделанных **до** установки фикса, уже ротировались
-из журнала, поэтому «до/после» по LTS точно не измерить. Сравнение выше —
-по загрузкам после 20:07, когда `disable_11ax` уже стоял в конфиге.
+Caveat: logs from LTS boots made **before** the fix was installed have already
+rotated out of the journal, so a precise before/after comparison for LTS is not
+possible. The comparison above is limited to boots after 20:07, when
+`disable_11ax` was already in the config.
 
 ---
 
-## Установка
+## Installation
 
 ```bash
 git clone https://github.com/Matvel007/intel-ax211-cachyos.git
@@ -295,68 +301,67 @@ sudo ./install.sh
 sudo reboot
 ```
 
-Или вручную — три `cp` и перезагрузка.
+Or manually — three `cp` calls and a reboot.
 
-### Проверка после перезагрузки
+### Verify after reboot
 
 ```bash
 ./diagnose.sh
 ```
 
-Скрипт покажет: ядро, версию прошивки, применённые параметры, скорость линка,
-счётчики сбоев по всем загрузкам.
+The script reports the kernel, firmware version, applied parameters, link rate,
+and crash counters across all boots.
 
 ---
 
-## Важно при переустановке системы
+## Important when reinstalling the OS
 
-Все три файла живут в `/etc` — **при переустановке они пропадают**, и проблема
-возвращается. Это ровно то, что случилось здесь: фикс был, переустановили
-систему, фикс исчез, симптомы вернулись.
+All three files live in `/etc` — **they are lost on a reinstall**, and the problem
+comes back. That is exactly what happened here: the fix existed, the system was
+reinstalled, the fix vanished, the symptoms returned.
 
-Дополнительно: `linux-firmware-intel` заморожен на `20260622-1` через
-`IgnorePkg` в `/etc/pacman.conf`, потому что сборка от 19.10.2026 валит карту
-намертво на **каждой** загрузке:
+Additionally: `linux-firmware-intel` is pinned to `20260622-1` via `IgnorePkg` in
+`/etc/pacman.conf`, because the 2026-10-19 build crashes the card on **every**
+boot:
 
 ```
 IgnorePkg   = linux-firmware-intel
 ```
 
-Эту строку тоже надо вернуть вручную.
+That line also has to be restored by hand.
 
 ---
 
-## Источники
+## References
 
 - [CachyOS forum: Intel AX211 (CNVi) completely disappears](https://discuss.cachyos.org/t/intel-ax211-cnvi-completely-disappears-on-cachyos-no-wi-fi-no-bluetooth/20544)
-  — тот же симптом, «only a full shutdown + power drain restores», на Windows
-  с тем же железом и BIOS всё работает
+  — same symptom, "only a full shutdown + power drain restores"; on Windows with
+  the same hardware and BIOS everything works
 - [kernelthread: 8086:7a70 probe fails with -110](https://kernelthread.org/t/871p9s34o2.fsf@chud.cyou)
-  — ровно этот PCI ID, восстановление через `remove` + `/sys/bus/pci/rescan`
+  — exactly this PCI ID, recovery via `remove` + `/sys/bus/pci/rescan`
 - [pop-os#4101: SPM / Power Management regression in linux-firmware (AX211)](https://github.com/pop-os/pop/issues/4101)
-  — регрессия linux-firmware, корреляция крашей с 5 ГГц BSS
-- [Ubuntu Discourse: AX211 s2idle на Dell 7430](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
-  — разбор TWT-path и рецепт `disable_11ax=1`
+  — linux-firmware regression, crash correlation with a 5 GHz BSS
+- [Ubuntu Discourse: AX211 s2idle on Dell 7430](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
+  — TWT-path analysis and the `disable_11ax=1` recipe
 - [CachyOS#673: Intel iwlwifi instability](https://github.com/CachyOS/linux-cachyos/issues/673)
-  — `Device error - SW reset`, `SYSTEM_STATISTICS_CMD`, SW TSO workaround для Wi-Fi 7
+  — `Device error - SW reset`, `SYSTEM_STATISTICS_CMD`, SW TSO workaround for Wi-Fi 7
 - [regzbot: iwlwifi IO_PAGE_FAULT and Master Disable Timed Out](https://linux-regtracking.leemhuis.info/regzbot/regression/lore/amzVtgQb2p-_nShU@debian.local/)
-  — регрессия `0eaa1f245ac0`
+  — regression `0eaa1f245ac0`
 - [Ubuntu #2148754](https://www.mail-archive.com/ubuntu-bugs@lists.ubuntu.com/msg6289716.html)
-  — разбор того же дампа: сбой платформенной инициализации CNVi, смена прошивки
-  не помогает
+  — same dump analyzed: platform-side CNVi init failure, changing firmware does not help
 
 ---
 
-## Оговорки
+## Caveats
 
-- Проверено на одной машине, один BIOS, два ядра. Не факт, что `disable_11ax`
-  поможет на других моделях с AX211 — но механизм (TWT в прошивке) у карты общий.
-- Восемь загрузок — достаточная выборка против пяти провалов из семи, но
-  не абсолютная гарантия. Долгосрочная проверка продолжается.
-- Падение прошивки на инициализации — баг ниже уровня драйвера. `disable_11ax`
-  его обходит, а не исправляет. Когда выйдет ядро с фиксом `0eaa1f245ac0`,
-  возможно, `disable_11ax` станет не нужен — проверять отдельно.
+- Verified on one machine, one BIOS, two kernels. `disable_11ax` may not help other
+  AX211 models — but the mechanism (TWT in firmware) is common to the card.
+- Eight boots is a solid sample against five failures out of seven, but not an
+  absolute guarantee. Long-term observation is ongoing.
+- The initialization crash is a bug below the driver level. `disable_11ax` works
+  around it rather than fixing it. Once a kernel with the `0eaa1f245ac0` fix ships,
+  `disable_11ax` may become unnecessary — retest separately.
 
-## Лицензия
+## License
 
 MIT
