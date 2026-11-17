@@ -303,6 +303,9 @@ sudo reboot
 
 Or manually — three `cp` calls and a reboot.
 
+Both scripts follow your locale (`$LC_ALL` / `$LC_MESSAGES` / `$LANG`): Russian
+output on `ru_*` locales, English otherwise. No flags to remember.
+
 ### Verify after reboot
 
 ```bash

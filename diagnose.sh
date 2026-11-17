@@ -1,48 +1,69 @@
 #!/usr/bin/env bash
-# Диагностика состояния Wi-Fi AX211 и сетевых устройств.
-# Запускать без root — только чтение.
+# Diagnose Intel AX211 Wi-Fi and network device state.
+# Read-only, no root needed.
+# Language follows the locale ($LC_ALL / $LC_MESSAGES / $LANG).
 set -uo pipefail
 
-echo "=== Ядро ==="
+detect_lang() {
+    local l="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+    case "$l" in
+        ru*|*_RU*|*_RU.*|*_ru*) echo ru ;;
+        *) echo en ;;
+    esac
+}
+L="$(detect_lang)"
+
+# say <english> <russian>
+say() {
+    if [ "$L" = ru ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi
+}
+# sayn <english> <russian>  -- no trailing newline
+sayn() {
+    if [ "$L" = ru ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
+
+say "=== Kernel ===" "=== Ядро ==="
 uname -r
 
 echo
-echo "=== Прошивка ==="
-echo -n "на диске: "
+say "=== Firmware ===" "=== Прошивка ==="
+sayn "on disk:   " "на диске: "
 if [ -f /usr/lib/firmware/intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode.zst ]; then
     zstd -dc /usr/lib/firmware/intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode.zst 2>/dev/null \
         | head -c 60 | strings | head -1
 else
-    echo "файл не найден"
+    say "not found" "файл не найден"
 fi
-echo -n "загружена: "
-journalctl -b 0 --no-pager 2>/dev/null | grep -oE '[0-9]+\.[0-9a-f]{8}\.0' | head -1 || echo "нет данных"
+sayn "loaded:    " "загружена: "
+journalctl -b 0 --no-pager 2>/dev/null | grep -oE '[0-9]+\.[0-9a-f]{8}\.0' | head -1 \
+    || say "no data" "нет данных"
 
 echo
-echo "=== Параметры модулей ==="
+say "=== Module parameters ===" "=== Параметры модулей ==="
 for p in disable_11ax power_save swcrypto bt_coex_active; do
     printf 'iwlwifi.%-15s = %s\n' "$p" "$(cat /sys/module/iwlwifi/parameters/$p 2>/dev/null || echo '?')"
 done
 printf 'iwlmvm.%-16s = %s\n' power_scheme "$(cat /sys/module/iwlmvm/parameters/power_scheme 2>/dev/null || echo '?')"
 
 echo
-echo "=== Линк ==="
-iw dev wlan0 link 2>/dev/null | grep -E 'SSID|signal|freq|bitrate' || echo "wlan0 не подключён"
-echo -n "power save: "
+say "=== Link ===" "=== Линк ==="
+iw dev wlan0 link 2>/dev/null | grep -E 'SSID|signal|freq|bitrate' \
+    || say "wlan0 not connected" "wlan0 не подключён"
+sayn "power save: " "power save: "
 iw dev wlan0 get power_save 2>/dev/null | sed 's/Power save: //'
 
 echo
-echo "=== RTL8125 ==="
+say "=== RTL8125 ===" "=== RTL8125 ==="
 if lsmod | grep -q '^r8169'; then
-    echo "r8169 загружен (проводной порт активен)"
+    say "r8169 loaded (wired port active)" "r8169 загружен (проводной порт активен)"
 else
-    echo "r8169 не загружен (blacklist работает)"
+    say "r8169 not loaded (blacklist working)" "r8169 не загружен (blacklist работает)"
 fi
-echo -n "AER-ошибок в текущей загрузке: "
-dmesg 2>/dev/null | grep -c 'AER' || echo 0
+sayn "AER errors in this boot: " "AER-ошибок в текущей загрузке: "
+dmesg 2>/dev/null | grep -cE 'PCIe Bus Error|aer_ratelimit|AER: (Corrected|Uncorrected)' || true
 
 echo
-echo "=== Сбои iwlwifi по загрузкам ==="
+say "=== iwlwifi failures per boot ===" "=== Сбои iwlwifi по загрузкам ==="
 for b in $(journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^-?[0-9]+$'); do
     k=$(journalctl -b "$b" --no-pager 2>/dev/null | grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-cachyos(-lts)?')
     n=$(journalctl -b "$b" --no-pager 2>/dev/null | grep -cE 'Failed to start RT|NMI_INTERRUPT_UNKNOWN')
@@ -54,7 +75,7 @@ for b in $(journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | g
 done
 
 echo
-echo "=== Итог ==="
+say "=== Summary ===" "=== Итог ==="
 total=0; bad=0
 for b in $(journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^-?[0-9]+$'); do
     total=$((total+1))
@@ -62,4 +83,4 @@ for b in $(journalctl --list-boots --no-pager 2>/dev/null | awk '{print $1}' | g
         bad=$((bad+1))
     fi
 done
-echo "загрузок: $total, с проблемами: $bad"
+say "boots: $total, with problems: $bad" "загрузок: $total, с проблемами: $bad"
