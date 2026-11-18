@@ -1,18 +1,31 @@
-# Intel AX211 (CNVi) на CachyOS: падение при загрузке, emergency mode, зависание выключения
+# CachyOS не грузится, Wi-Fi «падает»: AER-шторм от RTL8125
 
 [🇬🇧 English version](README.md)
 
 Разбор реальной проблемы и рабочее исправление. Всё проверено на живой машине,
-данные — из `journalctl`, `dmesg` и дампов прошивки.
+данные — из `journalctl`, `dmesg`, `lspci` и счётчиков AER.
 
-**TL;DR** — одна строка в `/etc/modprobe.d/iwlwifi.conf`:
+**TL;DR** — один параметр ядра, `pcie_aspm=off`:
 
+```bash
+# /etc/default/limine
+KERNEL_CMDLINE[default]+="quiet nowatchdog splash pcie_aspm=off rw rootflags=subvol=/@ root=UUID=..."
 ```
-options iwlwifi disable_11ax=1
+
+```bash
+sudo limine-update
 ```
 
-Откат с 802.11ax (Wi-Fi 6) на 802.11ac убирает падения прошивки. 8 загрузок
-подряд без единого сбоя, до этого — 5 провалов из 7.
+Проводной Realtek RTL8125 заваливает шину PCIe корректируемыми AER-ошибками:
+энергосбережение PCIe ASPM L1 не успевает его разбудить. Ошибки начинаются ещё
+до загрузки любого драйвера и тянут за собой весь чипсет — включая Wi-Fi Intel
+CNVi. После фикса: **0 AER-ошибок, 0 сбоев Wi-Fi, Wi-Fi 6 снова на 1921 Мбит/с**.
+
+> **Поправка к прежней версии этого репозитория.** Раньше здесь винили прошивку
+> AX211 и советовали `disable_11ax=1` (откат на 802.11ac). Это было неверно.
+> Откат снижал число сбоев только потому, что снижал нагрузку на шину, — а не
+> потому, что что-то исправлял. С настоящим фиксом Wi-Fi 6 работает без единого
+> сбоя, и `disable_11ax` убран. См. [Что НЕ является причиной](#что-не-является-причиной).
 
 ---
 
@@ -30,6 +43,9 @@ options iwlwifi disable_11ax=1
 | Прошивка Wi-Fi | `89.735b75a4.0`, `iwlwifi-so-a0-gf-a0-89.ucode` |
 | Загрузчик | Limine, btrfs + snapper |
 
+Проводной порт не используется — ноутбук работает по Wi-Fi. Кабель за всё время
+не подключался ни разу.
+
 ---
 
 ## Симптомы
@@ -38,14 +54,27 @@ options iwlwifi disable_11ax=1
 
 ### 1. Ноутбук не загружается
 
+Встаёт на логотипе CachyOS. На экране — десятки красных строк ядра. До рабочего
+стола не доходит.
+
+Пять загрузок подряд, одна и та же картина:
+
 ```
-Failed to load your GPU driver(s)
-You can't get into desktop environment right now
+boot   kernel              AER   iwl   graph
+-5     7.3.4-1-cachyos     220     0       0
+-4     7.3.4-1-cachyos     180     0       0
+-3     7.3.4-1-cachyos     160     0       0
+-2     7.3.4-1-cachyos     100     0       0
+-1     7.3.4-1-cachyos     240     0       0
+ 0     7.3.4-1-cachyos     440     0       1   <- дошла только эта
 ```
 
-Падение в emergency mode. Не помогало ничего: ни обычное ядро, ни LTS, ни
-загрузка со снапшота. `systemctl --failed` показывал `avahi-daemon.service` и
-`polkit.service`, что уводит в сторону — они просто жертвы.
+`graph = 0` значит, что `Reached target Graphical Interface` так и не наступил.
+Ядро всю загрузку печатало AER-ошибки вместо запуска systemd.
+
+На более раннем этапе сбой выглядел иначе — emergency mode с
+`Failed to load your GPU driver(s)`, а `systemctl --failed` показывал
+`avahi-daemon.service` и `polkit.service`. Оба — жертвы, а не причины.
 
 ### 2. Выключение зависает
 
@@ -55,24 +84,112 @@ You can't get into desktop environment right now
 pcieport 0000:00:1d.0: AER: Error of this Agent is reported first
 ```
 
-Помогает только кнопка питания.
+Помогает только кнопка питания. Обратите внимание на root port в этой строке —
+`0000:00:1d.0`, это родитель контроллера Realtek.
 
 ### 3. Wi-Fi отваливается в работе
 
 ```
+iwlwifi 0000:00:14.3: 0x00000084 | NMI_INTERRUPT_UNKNOWN
 iwlwifi 0000:00:14.3: Device error - SW reset
 iwlwifi 0000:00:14.3: restart completed
 ```
 
-Интернет пропадает на 30 секунд — 3.5 минуты, потом возвращается сам.
+Прошивка сбрасывается сама и восстанавливается за секунды — три раза за двадцать
+минут в одной сессии. Со стороны пользователя это выглядит как «Wi-Fi завис».
+Если сброс не завершается, машина виснет и нужна жёсткая перезагрузка.
 
 ---
 
 ## Диагностика
 
-### Настоящая причина зависания загрузки
+### Всё указывает на одно устройство
 
-Ключ — стек заблокированного процесса:
+Из **690 AER-ошибок** за одну загрузку **690 принадлежат `0000:05:00.0`** —
+проводному Realtek RTL8125. Wi-Fi-контроллер `0000:00:14.3` не упоминается
+ни разу:
+
+```bash
+journalctl -b 0 | grep 'PCIe Bus Error' | grep -oE 'pci [0-9a-f:]+' | sort | uniq -c
+```
+
+```
+    690 pci 0000:05:00
+```
+
+Типы ошибок:
+
+```
+    403 [12] Timeout   | Transmitter | Data Link Layer
+    400 [ 0] RxErr     | Receiver    | Physical Layer
+      7 [ 6] BadTLP    | Receiver
+      3 [ 8] Rollover  | Transmitter
+```
+
+`RxErr` на **физическом уровне** — главная улика: линк не тренируется, это не
+проблема программного протокола.
+
+### Начинается до загрузки любого драйвера
+
+Шторм стартует на **0.8 секунде загрузки**, когда в журнале ещё голое имя хоста
+(`cachyos`, а не `cachyos-x8664`) — это initramfs, до systemd и до загрузки
+модулей:
+
+```
+Nov 18 20:57:36 cachyos kernel: pcieport 0000:00:1d.0: PCIe Bus Error: severity=Correctable
+```
+
+То есть `r8169` не виноват. Blacklist драйвера ничего не меняет — устройство
+всё равно висит на шине и всё равно её заваливает. Проверено.
+
+### Масштаб
+
+```
+aer_ratelimit: 34739 callbacks suppressed
+```
+
+34 739 подавленных колбэков за одну вспышку. Ratelimiter ядра печатает несколько
+и молча отбрасывает остальные — поэтому журнал выглядит терпимо, хотя шина
+фактически насыщена.
+
+### Причина: ASPM L1
+
+```
+$ lspci -vv -s 05:00.0 | grep LnkCtl
+    LnkCtl: ASPM L1 Enabled; RCB 64 bytes, LnkDisable- CommClk+
+```
+
+PCIe Active State Power Management уводит линк в состояние пониженного
+энергопотребления. RTL8125 не успевает проснуться в аппаратный лимит (16 мкс),
+и каждая попытка пробуждения даёт корректируемую ошибку. Корректируемая значит,
+что линк восстанавливается сам — целостность данных в порядке, но шину молотят
+тысячи раз в секунду.
+
+Это известная проблема Realtek, описанная в разных дистрибутивах и на разных
+платах — см. [Источники](#источники).
+
+### Почему это валит Wi-Fi
+
+Модуль Wi-Fi CNVi и контроллер Ethernet сидят на одном чипсете. Когда шина
+насыщена обработкой ошибок, прошивка Wi-Fi не укладывается в свои сроки и
+сбрасывается. Сопоставьте время — совпадение точное:
+
+```
+20:45:11  PCIe Bus Error от 05:00.0
+20:45:13  iwlwifi: NMI_INTERRUPT_UNKNOWN -> SW reset
+20:47:06  PCIe Bus Error от 05:00.0
+20:47:08  iwlwifi: NMI_INTERRUPT_UNKNOWN -> SW reset
+```
+
+**Честная оговорка:** это корреляция, а не доказанный механизм. В одной загрузке
+было 6 AER-ошибок и ноль сбоев Wi-Fi, то есть объём AER сам по себе сброс не
+гарантирует. Доказано другое: после устранения шторма сбои Wi-Fi прекратились
+полностью.
+
+### Как это выглядело, когда драйвер Wi-Fi застревал
+
+Пока корневая причина не была ясна, сбой загрузки иногда показывал зависший
+`modprobe`, держащий глобальную блокировку модулей:
 
 ```bash
 journalctl --directory=/mnt/root/var/log/journal -b -1 | grep -A25 'task:modprobe'
@@ -84,161 +201,102 @@ task:modprobe  state:D
   synchronize_irq
   iwl_pcie_synchronize_irqs
   iwl_trans_pcie_gen2_stop_device
-  iwl_trans_stop_device
   iwl_mvm_start_get_nvm
   iwl_op_mode_mvm_start
-  iwl_opmode_register
-  iwl_mvm_init
   do_init_module
 ```
 
-Что происходит:
-
-1. Прошивка Wi-Fi падает на инициализации
-2. Драйвер пытается остановить устройство и **навсегда застревает** в
-   `synchronize_irq`, ожидая прерывание, которое уже не придёт
-3. Процесс `modprobe` держит `module_mutex` — глобальную блокировку загрузки модулей
-4. **После этого не грузится ни один модуль.** В том числе `nvidia_drm`
-5. Отсюда «Failed to load your GPU driver(s)» и emergency mode
-
-То есть GPU-ошибка — это следствие, а не причина. Отсюда и бесполезность
-снапшотов: дело не в корневой файловой системе.
-
-### Дамп прошивки при падении
-
-```
-iwlwifi 0000:00:14.3: 0x00000084 | NMI_INTERRUPT_UNKNOWN
-iwlwifi 0000:00:14.3: 0x20000066 | NMI_INTERRUPT_HOST
-iwlwifi 0000:00:14.3: 0x60000000 | FSEQ_ERROR_CODE
-iwlwifi 0000:00:14.3: SecBoot CPU1 Status: 0x8650, CPU2 Status: 0xb03
-iwlwifi 0000:00:14.3: Failed to start RT ucode: -110
-```
-
-`FSEQ_ERROR_CODE` ненулевой — это платформенная инициализация CNVi на стороне
-чипсета (CSME) проваливается **до** того, как драйвер вступает в дело.
-`SecBoot CPU1 Status` появляется только в неудачных загрузках, в успешных его нет.
-
-В работе падение выглядит иначе — предвестник:
-
-```
-iwlwifi 0000:00:14.3: Error sending SYSTEM_STATISTICS_CMD: time out after 2000ms.
-iwlwifi 0000:00:14.3: Current CMD queue read_ptr 831 write_ptr 832
-```
-
-Прошивка перестаёт отвечать на команды, потом падает.
-
-### Регрессия ядра, превращающая сбой в мёртвое зависание
-
-Коммит [`0eaa1f245ac0`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=0eaa1f245ac0)
-(«wifi: iwlwifi: mvm: don't support the reset handshake for old firmwares»),
-вошёл в **v7.1-rc7**.
-
-Код в `drivers/net/wireless/intel/iwlwifi/mvm/ops.c`:
-
-```c
-if (IWL_UCODE_MAJOR(mvm->fw->ucode_ver) <= 77)
-    trans->conf.fw_reset_handshake = false;
-```
-
-Прошивка версии 89 хранит версию в новом TLV-формате как `0x59` (89).
-`IWL_UCODE_MAJOR()` сдвигает на 24 бита и получает **0**. Условие `0 <= 77`
-истинно → reset-handshake отключается → драйвер теряет механизм мягкого сброса
-и виснет вместо перезапуска карты.
-
-Регрессия зарегистрирована в [regzbot](https://linux-regtracking.leemhuis.info/regzbot/regression/lore/amzVtgQb2p-_nShU@debian.local/)
-как «iwlwifi IO_PAGE_FAULT and Master Disable Timed Out».
-
-**Где исправлено:** в `linux-next`, но не в mainline на момент проверки
-(17.11.2026):
-
-```c
-trans->conf.fw_reset_handshake =
-    fw_has_capa(&mvm->fw->ucode_capa,
-                IWL_UCODE_TLV_CAPA_FW_RESET_HANDSHAKE) &&
-    mvm->fw->ucode_ver > 77;
-```
-
-**Практический вывод:** `7.3.4-1-cachyos` содержит регрессию, `6.18.60-2-cachyos-lts`
-— нет. Это единственное реальное различие между ядрами в контексте проблемы.
+Драйвер пытался остановить сбойное устройство и навсегда застревал в
+`synchronize_irq`, ожидая прерывание, которое уже не придёт. Поскольку `modprobe`
+держал `module_mutex`, после этого не грузился ни один модуль — включая
+`nvidia_drm`, отсюда «Failed to load your GPU driver(s)». GPU-ошибка была
+следствием, а не причиной, и снапшоты не могли помочь: дело было не в корневой
+файловой системе.
 
 ### Что НЕ является причиной
 
-Проверялось и отброшено:
-
-- **Прошивка.** Пробовал три билда: `735b75a4` (пакет 20260622),
-  `a67023b2` (core24.90-60, upstream от 08.11.2026), `123cf747` (core102-56).
-  Первый — 5 провалов из 7, второй — **11 из 12, стало хуже**, третий не
-  проверялся. Смена прошивки меняет вероятность, но не убирает причину.
-- **ASPM.** Уже выключен на обоих концах линка (`LnkCtl: ASPM Disabled`).
-- **Быстрая перезагрузка.** Корреляция с паузой была (20–27 с → сбой,
-  43 с → успех), но после фикса `disable_11ax` перезагрузки подряд без пауз
-  проходят чисто.
-- **`power_save` / `power_scheme`.** Помогают от другого — от высокого пинга,
-  но падения на инициализации не убирают.
-- **Хук `modprobe -r iwlwifi` в `system-shutdown`.** Не помогает и опасен: при
-  крахнутой карте выгрузка виснет в том же `synchronize_irq`, и выключение
-  зависает навсегда.
-- **AER-ошибки от Realtek RTL8125.** Отдельный дефект (см. ниже), к Wi-Fi
-  отношения не имеет.
+- **Прошивка Wi-Fi.** `disable_11ax=1` стоял полтора месяца в предположении, что
+  падает 802.11ax Target Wake Time path. Он снижал число сбоев за счёт снижения
+  нагрузки на шину, а не за счёт исправления. После настоящего фикса Wi-Fi 6
+  работает с **нулём** сбоев, и `disable_11ax` убран.
+- **Драйвер `r8169`.** Его blacklist ошибки не останавливает.
+- **Ядро.** Проверено на `7.3.4` и `6.18.60-lts` — поведение одинаковое.
+  Регрессия `0eaa1f245ac0` в основном ядре делает зависание *хуже*, когда оно
+  случается, но не вызывает его.
+- **Версия пакета прошивки.** Пробовал три билда; смена прошивки меняла
+  вероятность, но никогда не убирала проблему.
+- **btrfs или снапшоты.** Загрузка со снапшота падала точно так же.
 
 ---
 
 ## Исправление
 
-### 1. Отключить Wi-Fi 6 (802.11ax) — главное
+### Отключить PCIe ASPM
 
-`/etc/modprobe.d/iwlwifi.conf`:
+Добавить в командную строку ядра:
 
 ```
-options iwlwifi disable_11ax=1
-options iwlwifi power_save=0
-options iwlmvm power_scheme=1
+pcie_aspm=off
 ```
 
-Основание: разбор AX211 в [Ubuntu Discourse](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
-— «the firmware bug lives in the 802.11ax Target Wake Time path», откат на
-802.11ac его обходит.
-
-Почему работает: падение происходит в TWT-логике 802.11ax. Без ax карта
-инициализируется по другому пути, и `FSEQ_ERROR_CODE` не возникает.
-
-**Цена:** линк 802.11ac вместо 802.11ax. Скорость 1404–1733 Мбит/с вместо 1921
-при ширине 160 МГц. Для домашней сети незаметно.
-
-**Проверка:**
+В Limine (CachyOS, Arch) сгенерированный `/boot/limine.conf` руками править
+нельзя — правьте его источник:
 
 ```bash
-cat /sys/module/iwlwifi/parameters/disable_11ax    # → Y
-iw dev wlan0 link | grep bitrate                   # → VHT-MCS, не HE-MCS
+# /etc/default/limine
+KERNEL_CMDLINE[default]+="quiet nowatchdog splash pcie_aspm=off rw rootflags=subvol=/@ root=UUID=<ваш-uuid>"
 ```
 
-### 2. Убрать AER-шторм от RTL8125
-
-`/etc/modprobe.d/blacklist-r8169.conf`:
-
-```
-blacklist r8169
+```bash
+sudo limine-update
 ```
 
-Проблема: проводной порт без кабеля сыпет корректируемыми PCIe-ошибками.
+На системах с GRUB:
 
+```bash
+# /etc/default/grub
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash pcie_aspm=off"
 ```
-r8169 0000:05:00.0: PCIe Bus Error: severity=Correctable, type=Data Link Layer, (Transmitter ID)
-r8169 0000:05:00.0:    [12] Timeout
-aer_ratelimit: 9884 callbacks suppressed
+
+```bash
+sudo update-grub
 ```
 
-Почти десять тысяч подавленных сообщений за одну вспышку, до 4+ ошибок в секунду,
-каждая — прерывание. Причина в драйвере, не в железе: без `r8169` за 5+ минут
-**ноль** новых ошибок.
+### Проверка
 
-`blacklist` блокирует только автозагрузку. Понадобится проводной интернет:
+**Не судите по `lspci`.** Он продолжает показывать `ASPM L1 Enabled` и после
+фикса, потому что параметр велит ядру перестать *управлять* ASPM — он не
+переписывает то, что уже настроил BIOS. Судить надо по счётчику ошибок:
+
+```bash
+journalctl -b 0 | grep -c 'PCIe Bus Error'
+```
+
+Ноль — значит работает.
+
+### Цена
+
+Около +0.9 Вт в простое на порт. Для ноутбука это заметно, но немного. Если
+критично — попробуйте сначала `pcie_aspm.policy=performance`: ASPM остаётся
+включённым, но не уходит в самые глубокие состояния, иногда этого хватает.
+
+### Что не работает
+
+`pci=noaer` — **прячет** ошибки вместо исправления. Зависание загрузки
+прекращается (потому что зависание было из-за печати 34 тыс. строк), но шину
+продолжают молотить молча. Только как крайний вариант.
+
+### Опционально: не грузить неиспользуемый драйвер
+
+Если проводной порт не нужен, `blacklist r8169` не даёт интерфейсу подняться.
+Он **не** лечит AER-шторм — это стоит повторить, потому что в это верили долго.
+Чтобы вернуть кабель:
 
 ```bash
 sudo modprobe r8169
 ```
 
-### 3. Выключить энергосбережение Wi-Fi
+### Опционально: энергосбережение Wi-Fi
 
 `/etc/NetworkManager/conf.d/99-wifi-powersave-off.conf`:
 
@@ -247,44 +305,24 @@ sudo modprobe r8169
 wifi.powersave = 2
 ```
 
-Без этого пинг по локальной сети 40–165 мс вместо 1–3.
+Без этого пинг по локальной сети 40–165 мс вместо 1–3. К AER-шторму отношения
+не имеет, но вещь полезная.
 
 ---
 
 ## Результаты
 
-Замеры на `7.3.4-1-cachyos`, прошивка `735b75a4`.
+| | До | После |
+|---|---|---|
+| AER-ошибок за загрузку | 875 | **0** |
+| Сбоев прошивки Wi-Fi | 3 за 20 мин | **0** |
+| Загрузок, дошедших до графики | 1 из 6 | **все** |
+| Стандарт Wi-Fi | 802.11ac (`VHT-MCS 9`) | **802.11ax (`HE-MCS 9`)** |
+| Скорость приёма Wi-Fi | 1404 Мбит/с | **1921 Мбит/с** |
+| Пинг по LAN | 1.0–2.5 мс | 1.0–2.5 мс |
 
-### До исправления
-
-| | |
-|---|---|
-| Загрузок | 7 |
-| С провалом | **5** |
-| Зависаний `synchronize_irq` | 4 в одной загрузке |
-| `Device error - SW reset` в работе | 4 за день |
-
-### После
-
-| | |
-|---|---|
-| Загрузок на 7.3.4 | **8** |
-| С провалом | **0** |
-| Зависаний | 0 |
-| `Failed to start RT ucode` | 0 |
-| `Device error - SW reset` | 0 |
-| `SecBoot CPU1 Status` | не появлялся ни разу |
-
-Пинг по LAN: 1.0–2.5 мс, 0% потерь.
-Сигнал: −47 dBm, 160 МГц, `VHT-MCS 9`.
-
-Для сравнения, LTS `6.18.60` с тем же конфигом: **5 загрузок, 3 с провалом** (20:14, 20:44,
-20:47). То есть с фиксом обычное ядро лучше LTS — регрессия `0eaa1f245ac0` там
-не срабатывает, потому что прошивка больше не падает, а само ядро новее.
-
-Оговорка: логи LTS-загрузок, сделанных **до** установки фикса, уже ротировались
-из журнала, поэтому «до/после» по LTS точно не измерить. Сравнение выше —
-по загрузкам после 20:07, когда `disable_11ax` уже стоял в конфиге.
+После фикса `disable_11ax=1` был убран, и Wi-Fi 6 работает без сбоев — это
+подтверждает, что прошивка никогда не была проблемой.
 
 ---
 
@@ -297,7 +335,13 @@ sudo ./install.sh
 sudo reboot
 ```
 
-Или вручную — три `cp` и перезагрузка.
+Скрипт:
+
+1. добавляет `pcie_aspm=off` в командную строку ядра (`/etc/default/limine` или
+   `/etc/default/grub`) и пересобирает конфиг загрузчика;
+2. ставит конфиги энергосбережения Wi-Fi;
+3. опционально добавляет `r8169` в blacklist;
+4. каждый затронутый файл сохраняет как `.bak-<дата>`.
 
 Оба скрипта сами подстраивают язык под локаль (`$LC_ALL` / `$LC_MESSAGES` /
 `$LANG`): на `ru_*` печатают по-русски, иначе по-английски. Флагов запоминать
@@ -309,60 +353,64 @@ sudo reboot
 ./diagnose.sh
 ```
 
-Скрипт покажет: ядро, версию прошивки, применённые параметры, скорость линка,
-счётчики сбоев по всем загрузкам.
+Только чтение, root не нужен. Показывает: применён ли фикс, счётчик AER за
+текущую загрузку, какое устройство их даёт, число сбоев Wi-Fi и таблицу по всем
+загрузкам с корреляцией AER и успеха загрузки.
 
 ---
 
 ## Важно при переустановке системы
 
-Все три файла живут в `/etc` — **при переустановке они пропадают**, и проблема
-возвращается. Это ровно то, что случилось здесь: фикс был, переустановили
-систему, фикс исчез, симптомы вернулись.
-
-Дополнительно: `linux-firmware-intel` заморожен на `20260622-1` через
-`IgnorePkg` в `/etc/pacman.conf`, потому что сборка от 19.10.2026 валит карту
-намертво на **каждой** загрузке:
-
-```
-IgnorePkg   = linux-firmware-intel
-```
-
-Эту строку тоже надо вернуть вручную.
+- Фикс живёт в **командной строке ядра**, а не в конфиге модуля. Новое ядро его
+  сохранит; переустановка загрузчика или пересоздание `/etc/default/limine` —
+  потеряет.
+- Если после правки машина не грузится, держите `Shift`/`Esc` в меню Limine и
+  выберите снапшот.
+- После обновления BIOS проверьте заново — некоторые прошивки сбрасывают
+  политику ASPM.
 
 ---
 
 ## Источники
 
-- [CachyOS forum: Intel AX211 (CNVi) completely disappears](https://discuss.cachyos.org/t/intel-ax211-cnvi-completely-disappears-on-cachyos-no-wi-fi-no-bluetooth/20544)
-  — тот же симптом, «only a full shutdown + power drain restores», на Windows
-  с тем же железом и BIOS всё работает
-- [kernelthread: 8086:7a70 probe fails with -110](https://kernelthread.org/t/871p9s34o2.fsf@chud.cyou)
-  — ровно этот PCI ID, восстановление через `remove` + `/sys/bus/pci/rescan`
-- [pop-os#4101: SPM / Power Management regression in linux-firmware (AX211)](https://github.com/pop-os/pop/issues/4101)
-  — регрессия linux-firmware, корреляция крашей с 5 ГГц BSS
-- [Ubuntu Discourse: AX211 s2idle на Dell 7430](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
-  — разбор TWT-path и рецепт `disable_11ax=1`
-- [CachyOS#673: Intel iwlwifi instability](https://github.com/CachyOS/linux-cachyos/issues/673)
-  — `Device error - SW reset`, `SYSTEM_STATISTICS_CMD`, SW TSO workaround для Wi-Fi 7
-- [regzbot: iwlwifi IO_PAGE_FAULT and Master Disable Timed Out](https://linux-regtracking.leemhuis.info/regzbot/regression/lore/amzVtgQb2p-_nShU@debian.local/)
-  — регрессия `0eaa1f245ac0`
+- [AskUbuntu: PCIe Bus Error severity=Corrected, Physical Layer](https://askubuntu.com/questions/863150/pcie-bus-error-severity-corrected-type-physical-layer-id-00e5receiver-id)
+  — `pcie_aspm=off` как принятый ответ, с оговоркой, что `pci=noaer` только маскирует
+- [Proxmox forum: AER Correctable error message received](https://forum.proxmox.com/threads/aer-correctable-error-message-received.156497/)
+  — тот же root port `00:1d.0`, тот же `RxErr`, вылечено `pcie_aspm=off`
+- [Gentoo forums: PCI ethernet device issue related to AER](https://forums.gentoo.org/viewtopic-p-8819315.html)
+  — ошибки начинаются на 0.8 с, до загрузки драйвера
+- [Launchpad #2015670: r8169 kernel loop PCIe Bus Error](https://bugs.launchpad.net/bugs/2015670)
+  — отчёт именно по Realtek
 - [Ubuntu #2148754](https://www.mail-archive.com/ubuntu-bugs@lists.ubuntu.com/msg6289716.html)
-  — разбор того же дампа: сбой платформенной инициализации CNVi, смена прошивки
-  не помогает
+  — сбой платформенной инициализации CNVi, смена прошивки не помогает
+- [CachyOS forum: Intel AX211 (CNVi) completely disappears](https://discuss.cachyos.org/t/intel-ax211-cnvi-completely-disappears-on-cachyos-no-wi-fi-no-bluetooth/20544)
+  — то же железо, на Windows всё работает
+
+Ранее, когда подозревалась прошивка Wi-Fi:
+
+- [pop-os#4101: SPM / Power Management regression in linux-firmware (AX211)](https://github.com/pop-os/pop/issues/4101)
+- [CachyOS#673: Intel iwlwifi instability](https://github.com/CachyOS/linux-cachyos/issues/673)
+- [Ubuntu Discourse: AX211 s2idle на Dell 7430](https://discourse.ubuntu.com/t/abnormal-battery-drain-during-suspend-s2idle-on-dell-latitude-7430/89171?page=3)
+  — источник рецепта `disable_11ax=1`, который здесь оказался не нужен
 
 ---
 
 ## Оговорки
 
-- Проверено на одной машине, один BIOS, два ядра. Не факт, что `disable_11ax`
-  поможет на других моделях с AX211 — но механизм (TWT в прошивке) у карты общий.
-- Восемь загрузок — достаточная выборка против пяти провалов из семи, но
-  не абсолютная гарантия. Долгосрочная проверка продолжается.
-- Падение прошивки на инициализации — баг ниже уровня драйвера. `disable_11ax`
-  его обходит, а не исправляет. Когда выйдет ядро с фиксом `0eaa1f245ac0`,
-  возможно, `disable_11ax` станет не нужен — проверять отдельно.
+- Проверено на одной машине, один BIOS, два ядра. Механизм (задержка
+  пробуждения ASPM L1 на Realtek) распространённый, но другие модели могут вести
+  себя иначе.
+- Связь между объёмом AER и сбросом прошивки Wi-Fi — **корреляция, а не
+  доказательство**. В одной загрузке AER были, а сбоев Wi-Fi не было.
+- Корректируемые ошибки означают, что целостность данных не страдает. Это
+  проблема стабильности и производительности, а не порчи данных.
+- `pcie_aspm=off` действует глобально — на все устройства PCIe, не только на
+  Realtek. Побочных эффектов не замечено, но настройка общесистемная.
+- Если ошибки остаются и с фиксом, следующий шаг — BIOS: отключить *PCIe native
+  power management* / ASPM для LAN-контроллера.
+
+---
 
 ## Лицензия
 
-MIT
+MIT — см. [LICENSE](LICENSE).
