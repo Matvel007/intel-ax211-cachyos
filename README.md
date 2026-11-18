@@ -326,8 +326,8 @@ which confirms the firmware was never the problem.
 ## Installation
 
 ```bash
-git clone https://github.com/Matvel007/intel-ax211-cachyos.git
-cd intel-ax211-cachyos
+git clone https://github.com/Matvel007/rtl8125-aer-storm.git
+cd rtl8125-aer-storm
 sudo ./install.sh
 sudo reboot
 ```
